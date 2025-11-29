@@ -134,8 +134,7 @@ def offline_trajectory_optimization(trips, hub_idx, dist_from_hub, dist_to_hub, 
 
 
 # Main simulation loop
-target_fleet_size = 500
-
+target_fleet_size = Max_count
 for mv in fleet_sizes:
     cost, used, trips_num, served, total_pt, passenger_wait, total_ld, total_ed, total_idle_time, trips = simulate(mv)
 
