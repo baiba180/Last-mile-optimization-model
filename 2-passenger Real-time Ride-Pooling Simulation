@@ -2,7 +2,7 @@
 """
 Real-time Ride-Pooling Simulation with Hard 293s Waiting Constraint
 Optimized version for 2-passenger vehicles
-**Author:** 鲍鸿庆
+Author: 鲍鸿庆
 """
 
 import pandas as pd
