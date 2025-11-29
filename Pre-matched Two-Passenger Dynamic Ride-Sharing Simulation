@@ -1,6 +1,6 @@
 """
 Pre-matched Two-Passenger Dynamic Ride-Sharing Simulation
-Author: Hongqing Bao
+Author: 鲍鸿庆
 """
 
 import pandas as pd
