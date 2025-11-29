@@ -1,0 +1,247 @@
+"""
+Pre-matched Two-Passenger Dynamic Ride-Sharing Simulation
+Author: Hongqing Bao
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.sparse import load_npz
+from scipy.sparse.csgraph import dijkstra
+from dataclasses import dataclass
+from typing import List, Optional
+import heapq
+import gurobipy as gp
+from gurobipy import GRB
+import itertools
+import time
+from collections import defaultdict
+
+# Hub node ID
+HUB_NODE = 3099327955
+
+# ============================= Data Classes =============================
+@dataclass
+class Passenger:
+    id: int
+    request_time: float
+    destination_node: int
+    destination_idx: int
+    distance_from_hub: float
+    return_distance: float
+    dest_rank: int = -1
+    pickup_time: float = 0.0
+    dropoff_time: float = 0.0
+    station_wait_time: float = 0.0
+    group_id: Optional[int] = None
+
+@dataclass
+class PassengerGroup:
+    group_id: int
+    passengers: List[Passenger]
+    total_distance: float = 0.0
+    ready_time: float = 0.0
+
+@dataclass
+class Vehicle:
+    id: int
+    available_time: float
+    total_hub_wait_time: float = 0.0
+    trips: int = 0
+    def __lt__(self, other):
+        return (self.available_time, self.id) < (other.available_time, other.id)
+
+@dataclass
+class Trip:
+    vehicle_id: int
+    group: PassengerGroup
+    departure_time: float
+    return_time: float
+    total_loaded_distance: float
+    total_empty_distance: float
+    hub_wait_time: float
+
+# ============================= Load Network =============================
+node = pd.read_csv('node.csv')
+csr_mat = load_npz('csr_mat.npz')
+
+node_id_to_idx = dict(zip(node['node_id'], node.index))
+hub_idx = node_id_to_idx.get(HUB_NODE)
+if hub_idx is None:
+    raise ValueError(f"Hub node {HUB_NODE} not found!")
+
+# ============================= Precompute Shortest Paths =============================
+dist_from_hub_all = dijkstra(csr_mat, directed=True, indices=[hub_idx]).flatten()
+dist_to_hub_all = dijkstra(csr_mat.T, directed=True, indices=[hub_idx]).flatten()
+
+# ============================= Load Passenger Requests =============================
+data = pd.read_csv('passenger_requests.csv')
+passenger_startT = data['pickup_time'].tolist()
+passenger_D_A = data['dropoff_node'].tolist()
+
+# ============================= Create Passenger Objects =============================
+all_passengers = []
+dest_set = set()
+for pid, (t_req, node_id) in enumerate(zip(passenger_startT, passenger_D_A)):
+    if node_id not in node_id_to_idx:
+        continue
+    idx = node_id_to_idx[node_id]
+    d_out = dist_from_hub_all[idx]
+    d_back = dist_to_hub_all[idx]
+    if np.isinf(d_out) or np.isinf(d_back):
+        continue
+    p = Passenger(
+        id=pid,
+        request_time=t_req,
+        destination_node=node_id,
+        destination_idx=idx,
+        distance_from_hub=d_out,
+        return_distance=d_back
+    )
+    all_passengers.append(p)
+    dest_set.add(idx)
+
+unique_dest_idx = sorted(dest_set)
+n_dest = len(unique_dest_idx)
+dest_rank_map = {idx: i for i, idx in enumerate(unique_dest_idx)}
+for p in all_passengers:
+    p.dest_rank = dest_rank_map[p.destination_idx]
+
+# ============================= PassengerGroup ID Generator =============================
+_group_id_counter = 0
+def next_group_id() -> int:
+    global _group_id_counter
+    _group_id_counter += 1
+    return _group_id_counter
+
+# ============================= Precompute Destination Distance Matrix =============================
+dist_matrix = None
+if 0 < n_dest <= 6000:
+    dist_matrix = dijkstra(csr_mat, directed=True, indices=unique_dest_idx)
+
+# ============================= Cost Calculation =============================
+def calculate_group_cost_ultra_fast(passengers):
+    if not passengers:
+        return np.inf, 0, 0
+    sorted_p = sorted(passengers, key=lambda p: p.distance_from_hub)
+    total_loaded = 0.0
+    for i, p in enumerate(sorted_p):
+        if i == 0:
+            seg = p.distance_from_hub
+        else:
+            prev_idx = sorted_p[i-1].destination_idx
+            curr_idx = p.destination_idx
+            if dist_matrix is not None:
+                r1 = dest_rank_map[prev_idx]
+                r2 = dest_rank_map[curr_idx]
+                seg = dist_matrix[r1, r2]
+            else:
+                seg = dijkstra(csr_mat, indices=prev_idx, directed=True)[0, curr_idx]
+            if np.isinf(seg):
+                return np.inf, 0, 0
+        total_loaded += seg
+    return_dist = sorted_p[-1].return_distance
+    cost = (total_loaded + return_dist) / SPEED_M_PER_SEC
+    return cost, total_loaded, return_dist
+
+# ============================= Optimize Matching =============================
+def optimize_passenger_matching(passengers):
+    n = len(passengers)
+    if n < 2:
+        return []
+    pairs = list(itertools.combinations(range(n), VEHICLE_CAPACITY))
+    cost_dict = {}
+    detail_dict = {}
+    for i, j in pairs:
+        c, ld, ed = calculate_group_cost_ultra_fast([passengers[i], passengers[j]])
+        cost_dict[(i, j)] = c if not np.isinf(c) else 1e8
+        detail_dict[(i, j)] = (ld, ed)
+    m = gp.Model("Match")
+    m.Params.OutputFlag = 0
+    m.Params.TimeLimit = 15
+    x = m.addVars(pairs, vtype=GRB.BINARY)
+    m.setObjective(gp.quicksum(cost_dict[p] * x[p] for p in pairs), GRB.MINIMIZE)
+    for i in range(n):
+        m.addConstr(gp.quicksum(x[p] for p in pairs if i in p) == 1)
+    m.optimize()
+    selected = []
+    if m.status in (GRB.OPTIMAL, GRB.TIME_LIMIT):
+        for p in pairs:
+            if x[p].X > 0.5:
+                i, j = p
+                ld, ed = detail_dict[p]
+                selected.append(([passengers[i], passengers[j]], ld, ed))
+    return selected
+
+# ============================= Batch Matching =============================
+def match_passengers_in_batches(waiting, batch_size, time_add):
+    if len(waiting) < batch_size:
+        return [], waiting
+    batch = waiting[:batch_size]
+    remaining = waiting[batch_size:]
+    first_t = min(p.request_time for p in batch)
+    trigger_t = max(p.request_time for p in batch) + time_add
+    for p in batch:
+        p.station_wait_time = abs(trigger_t - p.request_time)
+        p.pickup_time = trigger_t
+    groups = optimize_passenger_matching(batch)
+    result = []
+    for idx, (pas, ld, ed) in enumerate(groups):
+        g = PassengerGroup(group_id=next_group_id(), passengers=pas, total_distance=ld+ed, ready_time=trigger_t)
+        for p in pas:
+            p.group_id = g.group_id
+        result.append((g, ld, ed))
+    return result, remaining
+
+# ============================= Main Simulation =============================
+def simulate(max_vehicles, batch_size, time_add):
+    all_passengers.sort(key=lambda p: p.request_time)
+    waiting = []
+    matched_groups = []
+    avail_heap = []
+    vehicles = {}
+    vehicle_counter = 0
+    trips = []
+    i = 0
+    if not all_passengers:
+        return 0,0,0,0
+    t = all_passengers[0].request_time
+
+    # Main loop
+    while True:
+        # New arrivals
+        while i < len(all_passengers) and all_passengers[i].request_time <= t + 1e-6:
+            waiting.append(all_passengers[i])
+            i += 1
+        # Trigger batch matching
+        if len(waiting) >= batch_size:
+            new_groups, waiting = match_passengers_in_batches(waiting, batch_size, time_add)
+            matched_groups.extend(new_groups)
+        # TODO: handle timeout passengers (like MAX_WAIT_THRESHOLD)
+        # TODO: assign vehicles, update trip info
+        # Advance time to next event
+        candidates = []
+        if i < len(all_passengers):
+            candidates.append(all_passengers[i].request_time)
+        if avail_heap:
+            candidates.append(avail_heap[0][0])
+        if matched_groups:
+            candidates.append(min(g[0].ready_time for g in matched_groups))
+        if waiting:
+            candidates.append(min(p.request_time for p in waiting) + MAX_WAIT_THRESHOLD)
+        future_events = [x for x in candidates if x > t + 1e-6]
+        if not future_events:
+            break
+        t = min(future_events)
+    # TODO: calculate total cost
+    return 0,0,0,0
+
+# ============================= Parameters =============================
+AVERAGE_SPEED = 25  # km/h
+SPEED_M_PER_SEC = AVERAGE_SPEED * 1000 / 3600
+MAX_WAIT_THRESHOLD = 293
+VEHICLE_CAPACITY = 2
+ALPHA_PASSENGER_TIME = 1.0
+BETA_LOADED_DIST = 1.0
+GAMMA_EMPTY_DIST = 1.0
+DELTA_HUB_WAIT = 0.5
+EPSILON_STATION_WAIT = 1.0
