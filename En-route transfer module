@@ -1,0 +1,164 @@
+def offline_trajectory_optimization(trips, hub_idx, dist_from_hub, dist_to_hub, csr_mat,
+                                    dest_rank=None, dist_between_dests=None):
+    """
+    Offline trajectory re-optimization by detecting spatial-temporal crossings
+    and reassigning passengers between two trips to reduce total vehicle time.
+    Returns total time saving and detailed optimization records.
+    author 鲍鸿庆
+    """
+    if len(trips) < 2:
+        return 0.0, []
+
+    # Reconstruct full trajectory (including return to hub)
+    trip_paths = {}
+    for idx, trip in enumerate(trips):
+        if not trip.passengers:
+            trip_paths[idx] = {'nodes': [hub_idx], 'times': [trip.departure_time]}
+            continue
+
+        sorted_p = sorted(trip.passengers, key=lambda p: p.distance_from_hub)
+        nodes = [hub_idx]
+        times = [trip.departure_time]
+        cur_pos = hub_idx
+        cur_t = trip.departure_time
+
+        for p in sorted_p:
+            if cur_pos == hub_idx:
+                dist = p.distance_from_hub
+            else:
+                r1 = dest_rank.get(cur_pos, -1) if dest_rank else -1
+                r2 = dest_rank.get(p.destination_idx, -1) if dest_rank else -1
+                if dist_between_dests is not None and r1 >= 0 and r2 >= 0:
+                    dist = dist_between_dests[r1, r2]
+                else:
+                    dist = dijkstra(csr_mat, indices=[cur_pos], directed=True)[0, p.destination_idx]
+                    if np.isinf(dist):
+                        dist = 1e8
+            cur_t += dist / SPEED_M_PER_SEC
+            nodes.append(p.destination_idx)
+            times.append(cur_t)
+            cur_pos = p.destination_idx
+
+        empty_dist = dist_to_hub[cur_pos]
+        cur_t += empty_dist / SPEED_M_PER_SEC
+        nodes.append(hub_idx)
+        times.append(cur_t)
+        trip_paths[idx] = {'nodes': nodes, 'times': times}
+
+    # Detect spatial-temporal crossings
+    EPS_TIME = 5  # seconds
+    crossings = []
+    for i in range(len(trips)):
+        for j in range(i + 1, len(trips)):
+            path1 = trip_paths[i]
+            path2 = trip_paths[j]
+            for node1, t1 in zip(path1['nodes'], path1['times']):
+                for node2, t2 in zip(path2['nodes'], path2['times']):
+                    if node1 == node2 and abs(t1 - t2) <= EPS_TIME:
+                        crossings.append((i, j, node1, (t1 + t2) / 2))
+                        break
+                else:
+                    continue
+                break
+
+    # Cost function for a passenger group
+    def trip_cost(passengers):
+        if not passengers:
+            return 0.0
+        sorted_p = sorted(passengers, key=lambda p: p.distance_from_hub)
+        cur = hub_idx
+        loaded = 0.0
+        for p in sorted_p:
+            if cur == hub_idx:
+                d = p.distance_from_hub
+            else:
+                d = dijkstra(csr_mat, indices=[cur], directed=True)[0, p.destination_idx]
+                if np.isinf(d):
+                    d = 1e8
+            loaded += d
+            cur = p.destination_idx
+        empty = dist_to_hub[cur]
+        return (loaded + empty) / SPEED_M_PER_SEC
+
+    total_saving = 0.0
+    records = []
+
+    for idxA, idxB, cross_node, t_approx in crossings:
+        tripA = trips[idxA]
+        tripB = trips[idxB]
+        passA = tripA.passengers[:]
+        passB = tripB.passengers[:]
+        all_pass = passA + passB
+        if len(all_pass) == 0 or len(all_pass) > 4:
+            continue
+
+        cost_before = trip_cost(passA) + trip_cost(passB)
+        best_cost = cost_before
+        best_g1, best_g2 = passA, passB
+
+        n = len(all_pass)
+        for mask in range(1 << n):
+            g1 = [all_pass[k] for k in range(n) if (mask & (1 << k))]
+            g2 = [p for p in all_pass if p not in g1]
+            if len(g1) > 2 or len(g2) > 2:
+                continue
+            c = trip_cost(g1) + trip_cost(g2)
+            if c < best_cost - 1e-6:
+                best_cost = c
+                best_g1, best_g2 = g1, g2
+
+        if best_cost < cost_before - 1e-6:
+            saving = cost_before - best_cost
+            total_saving += saving
+
+            records.append({
+                'optimization_id': len(records) + 1,
+                'trip_A_index': idxA,
+                'trip_B_index': idxB,
+                'vehicle_A_id': tripA.vehicle_id,
+                'vehicle_B_id': tripB.vehicle_id,
+                'original_group_A_passengers': [p.id for p in passA],
+                'original_group_B_passengers': [p.id for p in passB],
+                'new_group_1_passengers': [p.id for p in best_g1],
+                'new_group_2_passengers': [p.id for p in best_g2],
+                'cost_before_s': round(cost_before, 2),
+                'cost_after_s': round(best_cost, 2),
+                'time_saving_s': round(saving, 2),
+                'crossing_node_id': cross_node,
+                'crossing_time_approx': round(t_approx, 0),
+                'total_passengers': len(all_pass),
+                'is_full_load_reassignment': len(passA) == 2 and len(passB) == 2
+            })
+
+    return total_saving, records
+
+
+# Main simulation loop
+target_fleet_size = 500
+
+for mv in fleet_sizes:
+    cost, used, trips_num, served, total_pt, passenger_wait, total_ld, total_ed, total_idle_time, trips = simulate(mv)
+
+    if mv == target_fleet_size:
+        saving, optimization_records = offline_trajectory_optimization(
+            trips=trips,
+            hub_idx=hub_idx,
+            dist_from_hub=dist_from_hub,
+            dist_to_hub=dist_to_hub,
+            csr_mat=csr_mat,
+            dest_rank=dest_rank if 'dest_rank' in globals() else None,
+            dist_between_dests=dist_between_dests if 'dist_between_dests' in globals() else None
+        )
+
+        if optimization_records:
+            detail_df = pd.DataFrame(optimization_records)
+            # Save path should be configured by user
+            detail_df.to_csv("results/offline_trajectory_optimization_500veh_5s_window.csv",
+                             index=False, encoding='utf-8-sig')
+
+    # Store main results
+    results.append({ ... })  # your original result dictionary
+
+# Save main results
+df = pd.DataFrame(results)
+df.to_csv("results/system_performance_comparison.csv", index=False, encoding='utf-8-sig')
