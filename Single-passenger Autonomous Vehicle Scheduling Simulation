@@ -1,0 +1,166 @@
+"""
+Autonomous Vehicle Scheduling Simulation
+---------------------------------------
+This script simulates single-passenger shuttle dispatching from a hub 
+to multiple destination nodes using precomputed shortest-path distances.
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.sparse import load_npz
+from scipy.sparse.csgraph import dijkstra
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Tuple
+import heapq
+from collections import defaultdict
+
+# ------------------- Data Loading -------------------
+# User should place required files in /data directory
+node = pd.read_csv('data/node.csv')
+link = pd.read_csv('data/link.csv')
+csr_mat = load_npz('data/csr_mat.npz')
+data = pd.read_csv('data/taxi_data.csv')
+
+# Hub node ID (replace with actual ID)
+HUB_NODE = 0
+
+passenger_start_time = list(data['pickup_time'])
+passenger_dest_nodes = list(data['dropoff_node'])
+
+AVG_SPEED_KMH = 25
+SPEED_MPS = AVG_SPEED_KMH * 1000 / 3600
+
+# Cost weights
+ALPHA = 1.0
+BETA = 1.0
+GAMMA = 1.0
+DELTA = 0.5
+
+
+@dataclass
+class Vehicle:
+    id: int
+    available_time: float
+    total_wait_time: float = 0.0
+    trips: int = 0
+
+    def __lt__(self, other):
+        if self.available_time != other.available_time:
+            return self.available_time < other.available_time
+        return self.id < other.id
+
+
+@dataclass
+class Trip:
+    passenger_id: int
+    vehicle_id: int
+    start_time: float
+    pickup_time: float
+    dropoff_time: float
+    return_time: float
+    loaded_distance: float
+    empty_distance: float
+    wait_time: float
+
+
+def get_node_index(node_id, node_df):
+    idx = node_df[node_df['node_id'] == node_id].index
+    if len(idx) == 0:
+        return None
+    return idx[0]
+
+
+def simulate_vehicle_scheduling(max_vehicles, node_df, csr_matrix):
+    hub_idx = get_node_index(HUB_NODE, node_df)
+    if hub_idx is None:
+        return np.inf, [], 0
+
+    dist_from_hub = dijkstra(csr_matrix, indices=[hub_idx], directed=True).flatten()
+    dist_to_hub = dijkstra(csr_matrix.T, indices=[hub_idx], directed=True).flatten()
+
+    available_queue = []
+    vehicles = {}
+    trips = []
+    vehicle_counter = 0
+
+    node_id_to_idx = dict(zip(node_df['node_id'], node_df.index))
+
+    for pid, (start_time, dest_node) in enumerate(zip(passenger_start_time, passenger_dest_nodes)):
+        if dest_node not in node_id_to_idx:
+            continue
+
+        dest_idx = node_id_to_idx[dest_node]
+        d_out = dist_from_hub[dest_idx]
+        d_back = dist_to_hub[dest_idx]
+        if np.isinf(d_out) or np.isinf(d_back):
+            continue
+
+        # Vehicle assignment
+        vehicle = None
+        while available_queue and available_queue[0][0] <= start_time:
+            _, _, v = heapq.heappop(available_queue)
+            vehicle = v
+            break
+
+        if vehicle is None and len(vehicles) < max_vehicles:
+            vehicle_counter += 1
+            vehicle = Vehicle(vehicle_counter, 0.0)
+            vehicles[vehicle.id] = vehicle
+
+        if vehicle is None and available_queue:
+            _, _, vehicle = heapq.heappop(available_queue)
+
+        if vehicle is None:
+            continue
+
+        pickup_time = max(start_time, vehicle.available_time)
+        dropoff_time = pickup_time + d_out / SPEED_MPS
+        return_time = dropoff_time + d_back / SPEED_MPS
+        wait_time = pickup_time - start_time
+
+        vehicle.total_wait_time += wait_time
+        vehicle.available_time = return_time
+        vehicle.trips += 1
+
+        trips.append(Trip(pid, vehicle.id, start_time, pickup_time,
+                          dropoff_time, return_time, d_out, d_back, wait_time))
+
+        heapq.heappush(available_queue, (return_time, vehicle.id, vehicle))
+
+    # System cost
+    total_p_time = sum(t.dropoff_time - t.start_time for t in trips)
+    total_loaded = sum(t.loaded_distance for t in trips)
+    total_empty = sum(t.empty_distance for t in trips)
+    total_wait = sum(v.total_wait_time for v in vehicles.values())
+
+    total_idle = 0.0
+    trips_by_vehicle = defaultdict(list)
+    for t in trips:
+        trips_by_vehicle[t.vehicle_id].append(t)
+    for veh_trips in trips_by_vehicle.values():
+        veh_trips.sort(key=lambda x: x.start_time)
+        for i in range(len(veh_trips) - 1):
+            idle = veh_trips[i + 1].start_time - veh_trips[i].return_time
+            if idle > 0:
+                total_idle += idle
+
+    total_cost = (
+        ALPHA * total_p_time +
+        BETA * total_loaded / SPEED_MPS +
+        GAMMA * total_empty / SPEED_MPS +
+        DELTA * total_idle
+    )
+
+    return total_cost, trips, len(vehicles)
+
+
+if __name__ == "__main__":
+    fleet_sizes = list(range(50, 1300, 50))
+    results = []
+    for k in fleet_sizes:
+        cost, trips, used = simulate_vehicle_scheduling(k, node, csr_mat)
+        results.append([k, used, cost])
+
+    pd.DataFrame(results, columns=["fleet_size", "vehicles_used", "total_cost"]) \
+        .to_csv("results/fleet_cost_results.csv", index=False)
