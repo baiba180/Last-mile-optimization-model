@@ -3,7 +3,7 @@ Autonomous Vehicle Scheduling Simulation
 ---------------------------------------
 This script simulates single-passenger shuttle dispatching from a hub 
 to multiple destination nodes using precomputed shortest-path distances.
-**Author:** 鲍鸿庆
+Author: 鲍鸿庆
 """
 
 import pandas as pd
