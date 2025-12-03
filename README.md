@@ -19,7 +19,7 @@ All models enforce:
 - Vehicle capacity of 2 passengers
 - Radial routing strategy (destinations served in increasing distance order from hub)
 - Precomputed shortest-path distances using Dijkstra on sparse CSR network representation
-- System cost = passenger total time + loaded distance + empty return distance + vehicle idle time at hub
+- System cost = passenger total time + loaded distance + empty return distance + vehicle cost at hub
 
 ## Input Data (place in `data/` folder)
 
