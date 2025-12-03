@@ -11,8 +11,8 @@ This repository provides four event-based simulation models for hub-based autono
 3. **Pre-matched Two-Passenger Ride-Sharing**  
    Batch optimization using exact set-partitioning formulation (batch sizes 4, 6, 8, 10) solved by Gurobi, followed by real-time vehicle dispatching.
 
-4. **En-route Passenger Transfer (Offline Trajectory Re-optimization)**  
-   Post-simulation module that identifies spatial-temporal crossings between completed vehicle trajectories and reassigns passengers across trips to reduce total vehicle operating time. Supports configurable time window (e.g., 5 seconds) for crossing detection.
+4. **2-passenger Real-time Ride-Pooling Simulation with En-route transfer module**  
+   The en-route transfer module has been integrated into the 2-passenger code, allowing adjustment of minimum transfer limits, time windows, and maximum number of vehicles.
 
 All models enforce:
 - Maximum passenger waiting time of 293 seconds at the hub
