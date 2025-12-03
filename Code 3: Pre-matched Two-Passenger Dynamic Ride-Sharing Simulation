@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Real-time Ride-Pooling with Batch Matching and Hard 293s Waiting Constraint
+author: 鲍鸿庆
 """
 
 import pandas as pd
