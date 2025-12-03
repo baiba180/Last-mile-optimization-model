@@ -1,0 +1,748 @@
+"""
+2-passenger Real-time Ride-Pooling Simulation with En-route transfer module
+author：鲍鸿庆
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.sparse import load_npz
+from scipy.sparse.csgraph import dijkstra
+import matplotlib.pyplot as plt
+import seaborn as sns
+from dataclasses import dataclass
+from typing import List, Optional
+from functools import lru_cache
+import heapq
+import gurobipy as gp
+from gurobipy import GRB
+import itertools
+import time
+import os
+from collections import defaultdict
+from numpy import inf
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# Hub node identifier (replace with appropriate value)
+HUB_NODE = 3099327955
+
+# ============================= Data classes =============================
+@dataclass
+class Passenger:
+    id: int
+    request_time: float
+    destination_node: int
+    destination_idx: int
+    distance_from_hub: float
+    return_distance: float
+    dest_rank: int = -1
+    pickup_time: float = 0.0
+    dropoff_time: float = 0.0
+    station_wait_time: float = 0.0
+    group_id: Optional[int] = None
+
+@dataclass
+class PassengerGroup:
+    group_id: int
+    passengers: List[Passenger]
+    total_distance: float = 0.0
+    ready_time: float = 0.0
+
+@dataclass
+class Vehicle:
+    id: int
+    available_time: float
+    total_hub_wait_time: float = 0.0
+    trips: int = 0
+    def __lt__(self, other):
+        return (self.available_time, self.id) < (other.available_time, other.id)
+
+@dataclass
+class Trip:
+    vehicle_id: int
+    group: PassengerGroup
+    departure_time: float
+    return_time: float
+    total_loaded_distance: float
+    total_empty_distance: float
+    hub_wait_time: float
+
+# ============================= 1. Load network data =============================
+print("Loading network data...")
+node = pd.read_csv('data/node.csv')
+csr_mat = load_npz('data/csr_mat.npz')
+
+node_id_to_idx = dict(zip(node['node_id'], node.index))
+hub_idx = node_id_to_idx.get(HUB_NODE)
+if hub_idx is None:
+    raise ValueError(f"Hub node {HUB_NODE} not found")
+
+# ============================= 2. Precompute shortest paths =============================
+print("Precomputing shortest paths...")
+start_pre = time.time()
+
+# hub -> all nodes
+try:
+    dist_from_hub_all = dijkstra(
+        csgraph=csr_mat,
+        directed=True,
+        indices=[hub_idx],
+        return_predecessors=False
+    ).flatten()
+except Exception:
+    dist_from_hub_all = np.full(csr_mat.shape[0], np.inf)
+
+# all nodes -> hub (using transpose)
+try:
+    dist_to_hub_all = dijkstra(
+        csgraph=csr_mat.T,
+        directed=True,
+        indices=[hub_idx],
+        return_predecessors=False
+    ).flatten()
+except Exception:
+    dist_to_hub_all = np.full(csr_mat.shape[0], np.inf)
+
+print(f"Precompute complete in {time.time()-start_pre:.1f}s")
+
+# ============================= 3. Read passenger requests =============================
+requests = pd.read_csv('data/requests.csv')
+passenger_startT = requests['pickup_time'].tolist()
+passenger_D_A = requests['dropoff_node'].tolist()
+print(f"Total requests: {len(passenger_startT)}")
+
+# ============================= 4. Create passenger objects and unique destinations =============================
+all_passengers = []
+dest_set = set()
+for pid, (t_req, node_id) in enumerate(zip(passenger_startT, passenger_D_A)):
+    if node_id not in node_id_to_idx:
+        continue
+    idx = node_id_to_idx[node_id]
+    d_out = dist_from_hub_all[idx]
+    d_back = dist_to_hub_all[idx]
+    if np.isinf(d_out) or np.isinf(d_back):
+        continue
+    p = Passenger(
+        id=pid,
+        request_time=t_req,
+        destination_node=node_id,
+        destination_idx=idx,
+        distance_from_hub=d_out,
+        return_distance=d_back
+    )
+    all_passengers.append(p)
+    dest_set.add(idx)
+
+unique_dest_idx = sorted(dest_set)
+
+n_dest = len(unique_dest_idx)
+dest_rank_map = {idx: i for i, idx in enumerate(unique_dest_idx)}
+for p in all_passengers:
+    p.dest_rank = dest_rank_map[p.destination_idx]
+
+print(f"Valid passengers: {len(all_passengers)}, unique destinations: {n_dest}")
+
+# ============================= 5. Precompute destination-to-destination distance matrix =============================
+print(f"Precomputing {n_dest}x{n_dest} distance matrix...")
+t0 = time.time()
+try:
+    dist_matrix = dijkstra(
+        csgraph=csr_mat,
+        directed=True,
+        indices=unique_dest_idx,
+        return_predecessors=False
+    ).astype(float)
+except Exception:
+    dist_matrix = None
+
+print(f"Distance matrix complete in {time.time()-t0:.1f}s")
+
+# ============================= 6. Group cost calculation =============================
+def calculate_group_cost_ultra_fast(passengers):
+    if not passengers:
+        return np.inf, 0, 0
+    sorted_p = sorted(passengers, key=lambda p: p.distance_from_hub)
+    total_loaded = 0.0
+
+    for i, p in enumerate(sorted_p):
+        if i == 0:
+            seg = p.distance_from_hub
+        else:
+            prev_idx = sorted_p[i-1].destination_idx
+            curr_idx = p.destination_idx
+            if dist_matrix is not None:
+                r1 = dest_rank_map[prev_idx]
+                r2 = dest_rank_map[curr_idx]
+                seg = dist_matrix[r1, r2]
+            else:
+                seg = dijkstra(csr_mat, indices=prev_idx, directed=True, return_predecessors=False)[0, curr_idx]
+            if np.isinf(seg):
+                return np.inf, 0, 0
+        total_loaded += seg
+
+    return_dist = sorted_p[-1].return_distance
+    cost = (total_loaded + return_dist) / SPEED_M_PER_SEC
+    return cost, total_loaded, return_dist
+
+# ============================= 7. Matching optimization =============================
+def optimize_passenger_matching(passengers):
+    n = len(passengers)
+    if n < 2:
+        return []
+    pairs = list(itertools.combinations(range(n), VEHICLE_CAPACITY))
+    cost_dict = {}
+    detail_dict = {}
+
+    for i, j in pairs:
+        c, ld, ed = calculate_group_cost_ultra_fast([passengers[i], passengers[j]])
+        cost_dict[(i, j)] = c if not np.isinf(c) else 1e8
+        detail_dict[(i, j)] = (ld, ed)
+
+    m = gp.Model("Match")
+    m.Params.OutputFlag = 0
+    m.Params.TimeLimit = 15
+    x = m.addVars(pairs, vtype=GRB.BINARY)
+    m.setObjective(gp.quicksum(cost_dict[p] * x[p] for p in pairs), GRB.MINIMIZE)
+    for i in range(n):
+        m.addConstr(gp.quicksum(x[p] for p in pairs if i in p) == 1)
+    m.optimize()
+
+    selected = []
+    if m.status in (GRB.OPTIMAL, GRB.TIME_LIMIT):
+        for p in pairs:
+            if x[p].X > 0.5:
+                i, j = p
+                ld, ed = detail_dict[p]
+                selected.append(([passengers[i], passengers[j]], ld, ed))
+    return selected
+
+# ============================= 8. Batch matching =============================
+def match_passengers_in_batches(waiting, batch_size, time_add):
+    if len(waiting) < batch_size:
+        return [], waiting
+    batch = waiting[:batch_size]
+    remaining = waiting[batch_size:]
+
+    first_t = min(p.request_time for p in batch)
+    trigger_t = max(p.request_time for p in batch) + time_add
+    for p in batch:
+        p.station_wait_time = abs(trigger_t - p.request_time)
+        p.pickup_time = trigger_t
+
+    groups = optimize_passenger_matching(batch)
+
+    result = []
+    for idx, (pas, ld, ed) in enumerate(groups):
+        g = PassengerGroup(
+            group_id=next_group_id(),
+            passengers=pas,
+            total_distance=ld + ed,
+            ready_time=trigger_t
+        )
+        for p in pas:
+            p.group_id = g.group_id
+        result.append((g, ld, ed))
+    return result, remaining
+
+# Unique group id generator
+_group_id_counter = 0
+
+def next_group_id() -> int:
+    global _group_id_counter
+    _group_id_counter += 1
+    return _group_id_counter
+
+# ============================= 9. En-route transfer module =============================
+@dataclass
+class InTransitVehicle:
+    vehicle_id: int
+    current_trip: Trip
+    remaining_passengers: List[Passenger]
+    remaining_dest_sequence: List[int]
+    arrival_times: List[float]
+    return_time: float
+    node_arrival_times: dict
+
+in_transit_trip_dicts = {}
+in_transit_vehicles = []
+
+total_swap_loaded_saving = 0.0
+total_swap_empty_saving = 0.0
+total_swap_count = 0
+
+
+def dist_from(a: int, b: int) -> float:
+    if (dist_matrix is not None
+            and a in dest_rank_map
+            and b in dest_rank_map):
+        return dist_matrix[dest_rank_map[a], dest_rank_map[b]]
+
+    if a == hub_idx:
+        return dist_from_hub_all[b]
+
+    if b == hub_idx:
+        return dist_to_hub_all[a]
+
+    try:
+        dist = dijkstra(csr_mat, indices=a, directed=True, return_predecessors=False)
+        if isinstance(dist, tuple):
+            dist = dist[0]
+        result = dist[b]
+        return result if not np.isinf(result) else 1e8
+    except Exception:
+        return 1e8
+
+@lru_cache(maxsize=50000)
+def dist_from_cached(a: int, b: int) -> float:
+    return dist_from(a, b)
+
+
+def build_complete_trip_dict(trip):
+    node_time = {hub_idx: trip.departure_time}
+    cum_dist = 0.0
+    prev_node = hub_idx
+    sorted_p = sorted(trip.group.passengers, key=lambda p: p.distance_from_hub)
+
+    for p in sorted_p:
+        dest_idx = p.destination_idx
+        if prev_node == hub_idx:
+            seg_dist = dist_from_hub_all[dest_idx]
+        else:
+            r1 = dest_rank_map.get(prev_node, -1)
+            r2 = dest_rank_map.get(dest_idx, -1)
+            if r1 >= 0 and r2 >= 0:
+                seg_dist = dist_matrix[r1, r2]
+            else:
+                seg_dist = dist_from_cached(prev_node, dest_idx)
+
+        if np.isinf(seg_dist):
+            seg_dist = 1e8
+
+        try:
+            _, pred = dijkstra(csr_mat, indices=prev_node, directed=True, return_predecessors=True)
+            path = []
+            curr = dest_idx
+            while curr != -9999:
+                path.append(curr)
+                if curr == prev_node:
+                    break
+                curr = pred[0, curr]
+            path.reverse()
+        except Exception:
+            path = [prev_node, dest_idx]
+
+        if len(path) > 1:
+            segment_cum = 0.0
+            for i in range(1, len(path)):
+                edge_dist = dist_from_cached(path[i-1], path[i])
+                segment_cum += edge_dist
+                arrival_t = trip.departure_time + (cum_dist + segment_cum) / SPEED_M_PER_SEC
+                node_time[path[i]] = arrival_t
+
+        cum_dist += seg_dist
+        node_time[dest_idx] = trip.departure_time + cum_dist / SPEED_M_PER_SEC
+        prev_node = dest_idx
+
+    return node_time
+
+
+def calculate_remaining_loaded(start_node: int, passengers: List[Passenger]) -> float:
+    if not passengers:
+        return 0.0
+    if len(passengers) == 1:
+        return dist_from_cached(start_node, passengers[0].destination_idx)
+
+    p1, p2 = sorted(passengers, key=lambda p: dist_from_cached(start_node, p.destination_idx))
+    d1 = dist_from_cached(start_node, p1.destination_idx)
+    d2 = dist_from_cached(p1.destination_idx, p2.destination_idx)
+    return d1 + d2
+
+
+def try_enroute_passenger_swap(new_trip: Trip, current_time: float) -> bool:
+    global in_transit_trip_dicts, in_transit_vehicles
+    global total_swap_loaded_saving, total_swap_empty_saving, total_swap_count
+
+    target_trip_dict = build_complete_trip_dict(new_trip)
+
+    candidate_meetings = []
+    for meet_node, t_new in target_trip_dict.items():
+        if t_new < current_time - 10:
+            continue
+        for vid, old_dict in in_transit_trip_dicts.items():
+            if vid == new_trip.vehicle_id:
+                continue
+            if meet_node in old_dict:
+                t_old = old_dict[meet_node]
+                if t_old >= current_time - 10 and abs(t_new - t_old) <= DELTA_T_TRANSFER:
+                    meet_time = max(t_new, t_old)
+                    candidate_meetings.append((vid, meet_node, meet_time))
+
+    if not candidate_meetings:
+        in_transit_trip_dicts[new_trip.vehicle_id] = target_trip_dict
+        in_transit_vehicles = [v for v in in_transit_vehicles if v.vehicle_id != new_trip.vehicle_id]
+        in_transit_vehicles.append(InTransitVehicle(
+            vehicle_id=new_trip.vehicle_id,
+            current_trip=new_trip,
+            remaining_passengers=sorted(new_trip.group.passengers, key=lambda p: p.distance_from_hub),
+            remaining_dest_sequence=[p.destination_idx for p in new_trip.group.passengers],
+            arrival_times=[target_trip_dict.get(p.destination_idx, inf) for p in new_trip.group.passengers],
+            return_time=new_trip.return_time,
+            node_arrival_times=target_trip_dict
+        ))
+        return False
+
+    best_saving = 0
+    best_source_vid = best_meet_node = best_meet_time = None
+    best_allocation = None
+    best_p_new = best_p_old = None
+
+    for source_vid, meet_node, meet_time in candidate_meetings:
+        source_vehicle = next((v for v in in_transit_vehicles if v.vehicle_id == source_vid), None)
+        if not source_vehicle:
+            continue
+
+        p_new = [p for p in new_trip.group.passengers
+                 if target_trip_dict.get(p.destination_idx, inf) > meet_time + 1e-3]
+        p_old = [p for p in source_vehicle.remaining_passengers
+                 if source_vehicle.node_arrival_times.get(p.destination_idx, inf) > meet_time + 1e-3]
+
+        all_p = p_new + p_old
+        if not (2 <= len(all_p) <= 4):
+            continue
+
+        n = len(all_p)
+        local_best_loaded = float('inf')
+        local_best_split = None
+
+        for k in range(max(0, n-2), min(3, n+1)):
+            if k > 2 or (n - k) > 2:
+                continue
+            for comb in itertools.combinations(range(n), k):
+                g1 = [all_p[i] for i in comb]
+                g2 = [all_p[i] for i in range(n) if i not in comb]
+                cost = calculate_remaining_loaded(meet_node, g1) + calculate_remaining_loaded(meet_node, g2)
+                if cost < local_best_loaded:
+                    local_best_loaded = cost
+                    local_best_split = (g1, g2)
+
+        if local_best_split is None:
+            continue
+
+        orig_loaded = calculate_remaining_loaded(meet_node, p_new) + calculate_remaining_loaded(meet_node, p_old)
+        saving = orig_loaded - local_best_loaded
+
+        if saving > best_saving and saving >= MIN_SAVING_THRESHOLD:
+            best_saving = saving
+            best_source_vid = source_vid
+            best_meet_node = meet_node
+            best_meet_time = meet_time
+            best_allocation = local_best_split
+            best_p_new = p_new[:]
+            best_p_old = p_old[:]
+
+    if best_allocation is not None:
+        total_swap_count += 1
+        group_new_car, group_old_car = best_allocation
+
+        orig_loaded = calculate_remaining_loaded(best_meet_node, best_p_new) + calculate_remaining_loaded(best_meet_node, best_p_old)
+        new_loaded = calculate_remaining_loaded(best_meet_node, group_new_car) + calculate_remaining_loaded(best_meet_node, group_old_car)
+        loaded_saving = orig_loaded - new_loaded
+        total_swap_loaded_saving += loaded_saving
+
+        orig_last_new = best_p_new[-1].destination_idx if best_p_new else best_meet_node
+        orig_last_old = best_p_old[-1].destination_idx if best_p_old else best_meet_node
+        orig_empty = dist_to_hub_all[orig_last_new] + dist_to_hub_all[orig_last_old]
+
+        new_last_new = group_new_car[-1].destination_idx if group_new_car else best_meet_node
+        new_last_old = group_old_car[-1].destination_idx if group_old_car else best_meet_node
+        new_empty = dist_to_hub_all[new_last_new] + dist_to_hub_all[new_last_old]
+        empty_saving = orig_empty - new_empty
+        total_swap_empty_saving += max(0, empty_saving)
+
+        def update_trip(trip, passengers, meet_node, meet_time):
+            if not passengers:
+                trip.return_time = meet_time + 1e6
+                return
+
+            sorted_p = sorted(passengers,
+                              key=lambda p: dist_from_cached(meet_node, p.destination_idx))
+
+            cum = 0.0
+            prev = meet_node
+            for p in sorted_p:
+                seg = dist_from_cached(prev, p.destination_idx)
+                p.dropoff_time = meet_time + (cum + seg) / SPEED_M_PER_SEC
+                cum += seg
+                prev = p.destination_idx
+
+            trip.return_time = meet_time + cum / SPEED_M_PER_SEC + dist_to_hub_all[prev] / SPEED_M_PER_SEC
+
+        update_trip(new_trip, group_new_car, best_meet_node, best_meet_time)
+        old_vehicle = next(v for v in in_transit_vehicles if v.vehicle_id == best_source_vid)
+        update_trip(old_vehicle.current_trip, group_old_car, best_meet_node, best_meet_time)
+
+        new_trip.group.passengers = group_new_car
+        old_vehicle.current_trip.group.passengers = group_old_car
+
+        in_transit_trip_dicts[new_trip.vehicle_id] = build_complete_trip_dict(new_trip)
+        in_transit_trip_dicts[best_source_vid] = build_complete_trip_dict(old_vehicle.current_trip)
+
+        print(f"[{current_time/60:.1f}min] En-route passenger swap at node={best_meet_node}: loaded saving {loaded_saving/1000:.2f}km + empty saving {empty_saving/1000:.2f}km (swap #{total_swap_count})")
+
+        return True
+
+    in_transit_trip_dicts[new_trip.vehicle_id] = target_trip_dict
+    in_transit_vehicles = [v for v in in_transit_vehicles if v.vehicle_id != new_trip.vehicle_id]
+    in_transit_vehicles.append(InTransitVehicle(
+        vehicle_id=new_trip.vehicle_id, current_trip=new_trip,
+        remaining_passengers=sorted(new_trip.group.passengers, key=lambda p: p.distance_from_hub),
+        remaining_dest_sequence=[p.destination_idx for p in new_trip.group.passengers],
+        arrival_times=[target_trip_dict.get(p.destination_idx, inf) for p in new_trip.group.passengers],
+        return_time=new_trip.return_time,
+        node_arrival_times=target_trip_dict
+    ))
+    return False
+
+# ============================= 10. Main simulation =============================
+
+def simulate(max_vehicles, batch_size, time_add):
+    global in_transit_trip_dicts, total_swap_loaded_saving, total_swap_empty_saving, total_swap_count
+    in_transit_trip_dicts = {}
+    total_swap_loaded_saving = total_swap_empty_saving = total_swap_count = 0
+    in_transit_vehicles = []
+
+    all_passengers.sort(key=lambda p: p.request_time)
+    waiting = []
+    matched_groups = []
+    avail_heap = []
+    vehicles = {}
+    vehicle_counter = 0
+    trips = []
+    i = 0
+
+    if not all_passengers:
+        return 0, 0, 0, 0
+
+    t = all_passengers[0].request_time
+
+    while True:
+        while i < len(all_passengers) and all_passengers[i].request_time <= t + 1e-6:
+            waiting.append(all_passengers[i])
+            i += 1
+
+        triggered = False
+        if len(waiting) >= batch_size:
+            new_groups, waiting = match_passengers_in_batches(waiting, batch_size, time_add)
+            matched_groups.extend(new_groups)
+            triggered = True
+        elif waiting:
+            timeout_passengers = [p for p in waiting if t - p.request_time >= MAX_WAIT_THRESHOLD]
+
+            if timeout_passengers:
+                timeout_passengers.sort(key=lambda p: p.request_time)
+
+                if len(timeout_passengers) >= VEHICLE_CAPACITY:
+                    actual_batch = (len(timeout_passengers) // VEHICLE_CAPACITY) * VEHICLE_CAPACITY
+                    batch_to_match = timeout_passengers[:actual_batch]
+
+                    waiting = [p for p in waiting if p not in batch_to_match]
+
+                    new_groups, _ = match_passengers_in_batches(batch_to_match, len(batch_to_match), t)
+                    matched_groups.extend(new_groups)
+                    triggered = True
+
+                    remaining_timeout = timeout_passengers[actual_batch:]
+                else:
+                    remaining_timeout = timeout_passengers
+
+                timeout_single = []
+                for p in remaining_timeout:
+                    if p not in waiting:
+                        continue
+                    timeout_single.append(p)
+                for p in timeout_single:
+                    waiting.remove(p)
+
+                for p in timeout_single:
+                    loaded_dist = p.distance_from_hub
+                    return_dist = dist_to_hub_all[p.destination_idx]
+
+                    single_group = PassengerGroup(
+                        group_id=next_group_id(),
+                        passengers=[p],
+                        total_distance=loaded_dist + return_dist,
+                        ready_time=p.request_time + MAX_WAIT_THRESHOLD
+                    )
+                    matched_groups.append((single_group, loaded_dist, return_dist))
+                    triggered = True
+
+        to_remove = []
+        for item in matched_groups:
+            group, loaded, empty = item
+            if group.ready_time > t + 1e-6:
+                continue
+
+            v = None
+            while avail_heap and avail_heap[0][0] <= t + 1e-6:
+                _, _, v = heapq.heappop(avail_heap)
+                break
+
+            if v is None and len(vehicles) < max_vehicles:
+                vehicle_counter += 1
+                v = Vehicle(vehicle_counter, t)
+                vehicles[v.id] = v
+
+            if v is None:
+                continue
+
+            dep_time = max(t, v.available_time, group.ready_time)
+
+            for p in group.passengers:
+                p.pickup_time = dep_time
+                p.station_wait_time = dep_time - p.request_time
+
+            travel_time = loaded / SPEED_M_PER_SEC
+            return_time = dep_time + travel_time + empty / SPEED_M_PER_SEC
+
+            cum_dist = 0.0
+            prev_idx = hub_idx
+            sorted_passengers = sorted(group.passengers, key=lambda x: x.distance_from_hub)
+            for p in sorted_passengers:
+                if prev_idx == hub_idx:
+                    seg = p.distance_from_hub
+                else:
+                    r1 = dest_rank_map[prev_idx]
+                    r2 = p.dest_rank
+                    seg = dist_matrix[r1, r2] if dist_matrix is not None else dijkstra(csr_mat, indices=prev_idx, directed=True)[0, p.destination_idx]
+                cum_dist += seg
+                p.dropoff_time = dep_time + cum_dist / SPEED_M_PER_SEC
+                prev_idx = p.destination_idx
+
+            hub_wait = sum(dep_time - p.pickup_time for p in group.passengers)
+            v.total_hub_wait_time += hub_wait
+
+            trip = Trip(v.id, group, dep_time, return_time, loaded, empty, hub_wait)
+            trips.append(trip)
+
+            try_enroute_passenger_swap(trip, t)
+
+            v.available_time = return_time
+            v.trips += 1
+            heapq.heappush(avail_heap, (return_time, v.id, v))
+            to_remove.append(item)
+
+        for item in to_remove:
+            matched_groups.remove(item)
+
+        candidates = []
+        if i < len(all_passengers):
+            candidates.append(all_passengers[i].request_time)
+        if avail_heap:
+            candidates.append(avail_heap[0][0])
+        if matched_groups:
+            candidates.append(min(g[0].ready_time for g in matched_groups))
+        if waiting:
+            first_wait = min(p.request_time for p in waiting)
+            candidates.append(first_wait + MAX_WAIT_THRESHOLD)
+
+        future_events = [x for x in candidates if x > t + 1e-6]
+        if not future_events:
+            break
+        t = min(future_events)
+
+    served_passengers = [p for trip in trips for p in trip.group.passengers]
+    if not served_passengers:
+        total_cost = 0.0
+    else:
+        total_passenger_time = sum(p.dropoff_time - p.pickup_time for p in served_passengers)
+        passenger_wait = sum(p.station_wait_time for p in served_passengers)
+
+        total_loaded_original = sum(t.total_loaded_distance for t in trips)
+        total_empty_original = sum(t.total_empty_distance for t in trips)
+
+        actual_loaded = total_loaded_original - total_swap_loaded_saving
+        actual_empty = total_empty_original - total_swap_empty_saving
+
+        total_idle_time = 0.0
+        trips_by_vehicle = defaultdict(list)
+        for t_ in trips:
+            trips_by_vehicle[t_.vehicle_id].append(t_)
+        for veh_trips in trips_by_vehicle.values():
+            if len(veh_trips) >= 2:
+                veh_trips.sort(key=lambda x: x.departure_time)
+                for i_ in range(1, len(veh_trips)):
+                    idle = veh_trips[i_].departure_time - veh_trips[i_-1].return_time
+                    if idle > 0:
+                        total_idle_time += idle
+
+        total_cost = (ALPHA_PASSENGER_TIME * total_passenger_time +
+                      BETA_LOADED_DIST * actual_loaded / SPEED_M_PER_SEC +
+                      GAMMA_EMPTY_DIST * actual_empty / SPEED_M_PER_SEC +
+                      DELTA_HUB_WAIT * total_idle_time)
+
+    return (total_cost,
+            len(vehicles),
+            len(trips),
+            len(served_passengers),
+            total_passenger_time,
+            passenger_wait,
+            total_loaded_original,
+            total_empty_original,
+            total_swap_loaded_saving,
+            total_swap_empty_saving,
+            total_idle_time,
+            total_swap_count)
+
+# ============================= 11. Parameters and execution =============================
+HUB_NODE = 3099327955
+AVERAGE_SPEED = 25  # km/h
+SPEED_M_PER_SEC = AVERAGE_SPEED * 1000 / 3600
+MAX_WAIT_THRESHOLD = 293
+VEHICLE_CAPACITY = 2
+
+ALPHA_PASSENGER_TIME = 1.0
+BETA_LOADED_DIST = 1.0
+GAMMA_EMPTY_DIST = 1.0
+DELTA_HUB_WAIT = 0.5
+EPSILON_STATION_WAIT = 1.0
+
+batch_sizes = [2]
+max_fleet_sizes = list(range(20, 840, 20))
+DELTA_T_TRANSFER = 0
+MIN_SAVING_THRESHOLD = 0
+time_add = 0
+
+results = []
+print("Starting simulations...")
+total_start = time.time()
+
+for bs in batch_sizes:
+    for mv in max_fleet_sizes:
+        total_cost, num_vehicles, num_trips, num_passengers, \
+        total_passenger_time, passenger_wait, total_loaded_original, total_empty_original, \
+        total_swap_loaded_saving, total_swap_empty_saving, \
+        total_idle_time, total_swap_count = simulate(mv, bs, time_add)
+        results.append({
+            'max_vehicles': mv,
+            'used_vehicles': num_vehicles,
+            'social_cost_per_sec': total_cost,
+            'num_trips': num_trips,
+            'served_passengers': num_passengers,
+            'avg_passengers_per_trip': round(num_passengers / num_trips, 3) if num_trips else 0,
+            'total_passenger_time_s': total_passenger_time,
+            'total_station_wait_s': passenger_wait,
+            'loaded_km': round(total_loaded_original / 1000, 1),
+            'empty_km': round(total_empty_original / 1000, 1),
+            'loaded_saving_km': round(total_swap_loaded_saving / 1000, 1),
+            'empty_saving_km': round(total_swap_empty_saving / 1000, 1),
+            'actual_total_km': round((total_loaded_original-total_swap_loaded_saving +total_empty_original- total_swap_empty_saving) / 1000, 1),
+            'idle_time_s': total_idle_time,
+            'swap_count': total_swap_count,
+        })
+
+print(f"Completed in {time.time()-total_start:.1f}s")
+
+df = pd.DataFrame(results)
+df.to_csv('prematched_ridesharing_results_FINAL.csv', index=False, encoding='utf-8-sig')
+print("Results saved: prematched_ridesharing_results_FINAL.csv")
