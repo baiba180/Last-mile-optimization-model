@@ -1,6 +1,10 @@
 """
 2-passenger Real-time Ride-Pooling Simulation with En-route transfer module
 author：鲍鸿庆
+
+## Citation
+Please cite the following paper if you use this code in your research:
+Bao, H., Luo, X., Su, Q., & Wang, H. (2025). Optimizing last-mile public transit services by leveraging modu
 """
 
 import pandas as pd
