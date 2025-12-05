@@ -5,7 +5,7 @@ author: 鲍鸿庆
 
 ## Citation
 Please cite the following paper if you use this code in your research:
-Bao, H., Luo, X., Su, Q., & Wang, H. (2025). Optimizing last-mile public transit services by leveraging modu
+Bao, H., Luo, X., Su, Q., & Wang, H. (2025). Optimizing last-mile public transit services by leveraging modular autonomous vehicles. Journal of Transportation Engineering, Part A: Systems, 151(8). https://doi.org/10.1061/JTEPBS.TEENG-8954
 """
 
 import pandas as pd
