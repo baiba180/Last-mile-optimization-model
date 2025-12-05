@@ -23,10 +23,10 @@ All models enforce:
 
 ## Input Data (place in `data/` folder)
 
-- `node.csv` – Node ID to index mapping
+- `node_id.csv` – Node ID to index mapping
 - `csr_mat.npz` – Road network adjacency matrix in SciPy CSR format
 - `demand.csv` – Passenger requests with columns:
-  - `pickup_time` (seconds from simulation start)
+  - `pickup_time` (Time when the request was submitted, seconds from simulation start)
   - `dropoff_node` (destination node ID)
 
 ## Output
@@ -38,9 +38,9 @@ Each script saves results in the `results/` directory:
 ## Requirements
 
 ```bash
-pip install pandas numpy scipy gurobipy
+pip install pandas numpy scipy matplotlib seaborn gurobipy
+If your Python version is lower than 3.7: pip install dataclasses
 
 ## Citation
 Please cite the following paper if you use this code in your research:
-APA (7th Edition)
 Bao, H., Luo, X., Su, Q., & Wang, H. (2025). Optimizing last-mile public transit services by leveraging modular autonomous vehicles. Journal of Transportation Engineering, Part A: Systems, 151(8). https://doi.org/10.1061/JTEPBS.TEENG-8954
