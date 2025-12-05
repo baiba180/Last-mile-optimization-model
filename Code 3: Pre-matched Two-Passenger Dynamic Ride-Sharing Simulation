@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Real-time Ride-Pooling with Batch Matching and Hard 293s Waiting Constraint
+Pre-matched Two-Passenger Real-time Ride-Pooling with Batch Matching and Hard 293s Waiting Constraint
 author: 鲍鸿庆
+
+## Citation
+Please cite the following paper if you use this code in your research:
+Bao, H., Luo, X., Su, Q., & Wang, H. (2025). Optimizing last-mile public transit services by leveraging modu
 """
 
 import pandas as pd
