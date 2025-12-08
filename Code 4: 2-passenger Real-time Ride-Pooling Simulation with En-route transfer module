@@ -115,7 +115,7 @@ requests = pd.read_csv('data/requests.csv')
 passenger_startT = requests['pickup_time'].tolist()
 passenger_D_A = requests['dropoff_node'].tolist()
 print(f"Total requests: {len(passenger_startT)}")
-
+DELTA_T_TRANSFER = 30
 # ============================= 4. Create passenger objects and unique destinations =============================
 all_passengers = []
 dest_set = set()
@@ -713,7 +713,6 @@ EPSILON_STATION_WAIT = 1.0
 
 batch_sizes = [2]
 max_fleet_sizes = list(range(20, 840, 20))
-DELTA_T_TRANSFER = 0
 MIN_SAVING_THRESHOLD = 0
 time_add = 0
 
@@ -749,4 +748,4 @@ print(f"Completed in {time.time()-total_start:.1f}s")
 
 df = pd.DataFrame(results)
 df.to_csv('prematched_ridesharing_results_FINAL.csv', index=False, encoding='utf-8-sig')
-print("Results saved: prematched_ridesharing_results_FINAL.csv")
+print("Results saved: prematched_ridesharing_results.csv")
